@@ -1,0 +1,9 @@
+transformers>=4.56
+accelerate
+datasets
+safetensors
+huggingface_hub
+pandas
+scipy
+matplotlib
+tqdm
