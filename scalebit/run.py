@@ -180,6 +180,7 @@ class Experiment:
     @torch.no_grad()
     def check_determinism(self, n=5):
         bad = 0
+        n = min(n, len(self.task.items))
         for it in self.task.items[:n]:
             r = self.task.judge(self.model, it, self.gold[it["qid"]])
             bad += r["outcome"] != "masked"
