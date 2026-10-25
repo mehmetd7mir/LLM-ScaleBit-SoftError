@@ -97,6 +97,34 @@ class Format:
             xor_bit(t, idx, bit)
         self._set(layer.module.weight.data, h["region"], h["saved"])
 
+    def stored_words(self, layer, cls):
+        """Raw stored values of one class in one layer, as integers (for bit statistics)."""
+        raise NotImplementedError
+
+    @torch.no_grad()
+    def constant_bits(self, classes=None):
+        """For every layer and class: the bit positions that hold the same value in all fields,
+        and that value. A decoder that forces these bits back to their known value corrects any
+        flip in them at no memory cost (one small pattern per tensor)."""
+        out = {}
+        for cls in classes or self.metadata_classes:
+            width = self.classes[cls]
+            per_layer = []
+            for layer in self.layers:
+                w = self.stored_words(layer, cls)
+                const = {}
+                if w.numel() <= 1:  # a single value has nothing to compare against
+                    per_layer.append(const)
+                    continue
+                for b in range(width):
+                    bits = (w >> b) & 1
+                    lo, hi = int(bits.min()), int(bits.max())
+                    if lo == hi:
+                        const[b] = lo
+                per_layer.append(const)
+            out[cls] = per_layer
+        return out
+
     @torch.no_grad()
     def fingerprint(self):
         """Checksum of all target weights and stored arrays. Any single bit left flipped changes

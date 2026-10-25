@@ -191,3 +191,14 @@ def test_nvfp4_matches_llm_compressor():
     codes, sc, s_dec = nvfp4.quantize(w)
     assert torch.equal(scale.float(), e4m3_decode(sc))
     assert torch.equal(nvfp4.dequantize(codes, sc, s_dec, torch.float16), ref.half())
+
+
+def test_constant_bits_found_and_single_field_skipped():
+    lin = linear()
+    f = make_format("mxfp4", torch.float16)
+    f.prepare(None, [("m.q_proj", lin)])
+    const = f.constant_bits()["scale"][0]
+    assert const.get(7) == 0          # small weights never set the E8M0 MSB
+    g = make_format("nvfp4", torch.float16)
+    g.prepare(None, [("m.q_proj", linear())])
+    assert g.constant_bits(["tensor_scale"])["tensor_scale"][0] == {}

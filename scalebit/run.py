@@ -39,10 +39,13 @@ class Config:
     dtype: str = "float16"
     gptq_id: str = None
     trials_per_bit: int = 300
-    trials_override: dict = dataclasses.field(default_factory=dict)  # class -> trials per bit
+    # class -> trials per bit. The NVFP4 tensor scale is 1 value per layer (~0.2% of bits), so a
+    # few trials per bit are enough; element bits get more to tighten their upper bound.
+    trials_override: dict = dataclasses.field(
+        default_factory=lambda: {"element": 1000, "tensor_scale": 30})
     classes: list = None           # None = all classes of the format
     n_questions: int = None        # None = all 100
-    max_new_tokens: int = 256
+    max_new_tokens: int = 512
     seed: int = 2026
     restore_check_every: int = 50
 
@@ -106,6 +109,7 @@ class Experiment:
         self.task = make_task(cfg.task, self.tok, self.device, cfg.n_questions,
                               cfg.max_new_tokens, eos)
         self.classes = cfg.classes or list(self.fmt.classes)
+        self.save_constant_bits()
         self.write_run_info(setup_seconds=round(time.time() - t0, 1))
         print(f"{self.fmt.name}: {len(self.fmt.layers)} layers, {self.prep_info}")
         print(f"results: {self.dir}")
@@ -142,6 +146,24 @@ class Experiment:
         with open(path, "w") as f:
             json.dump(hist, f, indent=2, default=str)
 
+    def save_constant_bits(self):
+        """Bits that never change inside a tensor. Used later to compute the FIT a decoder would
+        have if it forced these bits back to their known value (no extra trials needed)."""
+        classes = list(self.fmt.classes) if not self.fmt.metadata_classes else \
+            list(self.fmt.metadata_classes)
+        const = self.fmt.constant_bits(classes)
+        path = os.path.join(self.dir, "constant_bits.json")
+        with open(path, "w") as f:
+            json.dump({c: [{str(b): v for b, v in layer.items()} for layer in layers]
+                       for c, layers in const.items()}, f)
+        for c, layers in const.items():
+            counts = self.fmt.field_counts(c)
+            total = sum(counts)
+            share = {b: sum(n for n, l in zip(counts, layers) if b in l) / total
+                     for b in range(self.fmt.classes[c])}
+            fixed = [f"b{b}:{v:.2f}" for b, v in sorted(share.items(), reverse=True) if v > 0]
+            print(f"constant bits ({c}, share of fields): {' '.join(fixed) or 'none'}")
+
     # ------------------------------------------------------------------------ golden
     def golden(self):
         path = os.path.join(self.dir, "golden.jsonl")
@@ -166,7 +188,8 @@ class Experiment:
         print(f"golden accuracy {acc}/{n}, non-finite {bad}")
         if self.cfg.task == "gsm8k":
             unstable = sum(not g.get("stable", True) for g in self.gold.values())
-            print(f"gsm8k: {unstable} questions without a stable golden (excluded from trials)")
+            cut = sum(bool(g.get("truncated", False)) for g in self.gold.values())
+            print(f"gsm8k: {unstable} unstable and {cut} truncated goldens (both excluded from trials)")
         if bad:
             print("WARNING: NaN/Inf without any fault. This dtype does not suit this model; "
                   "do not run trials.")
@@ -174,7 +197,8 @@ class Experiment:
 
     def usable_qids(self):
         return [it["qid"] for it in self.task.items
-                if self.gold[it["qid"]]["finite"] and self.gold[it["qid"]].get("stable", True)]
+                if self.gold[it["qid"]]["finite"] and self.gold[it["qid"]].get("stable", True)
+                and not self.gold[it["qid"]].get("truncated", False)]
 
     # ------------------------------------------------------------------------ checks
     @torch.no_grad()
@@ -295,6 +319,53 @@ class Experiment:
         for cls in self.classes:
             self.run_class(cls)
         summarize(self.dir)
+
+    PERSIST_FIELDS = ["fault", "bit_class", "bit", "layer", "layer_name", "field", "old_value",
+                      "new_value", "questions", "masked", "benign", "sdc", "visible",
+                      "golden_correct", "faulty_correct", "seconds", "status"]
+
+    def run_persistent(self, cls, bit, n_faults=20):
+        """A memory fault stays until the model is reloaded, so it hits every later question.
+        Flip one bit, run every usable question with the fault in place, restore; repeat for
+        n_faults random fields. Answers: does one flip break a few answers or the whole model?"""
+        path = os.path.join(self.dir, f"persistent_{cls}_b{bit}.csv")
+        done = set()
+        if os.path.exists(path):
+            _truncate_partial_line(path)
+            with open(path, newline="") as f:
+                done = {int(r["fault"]) for r in csv.DictReader(f) if r.get("status") == "ok"}
+        counts = np.array(self.fmt.field_counts(cls), dtype=np.float64)
+        qids = self.usable_qids()
+        items = {it["qid"]: it for it in self.task.items}
+        base = [self.cfg.seed, zlib.crc32(b"persistent"), zlib.crc32(cls.encode()), bit]
+        with _CSV(path, self.PERSIST_FIELDS, flush_every=1) as out:
+            for i in range(n_faults):
+                if i in done:
+                    continue
+                rng = np.random.default_rng(base + [i])
+                L = int(rng.choice(len(counts), p=counts / counts.sum()))
+                field = int(rng.integers(0, int(counts[L])))
+                t0 = time.time()
+                h = self.fmt.flip(L, cls, field, bit)
+                tally = {"masked": 0, "benign": 0, "sdc": 0, "visible": 0}
+                ok = 0
+                try:
+                    for q in _progress(qids, f"fault {i}"):
+                        r = self.task.judge(self.model, items[q], self.gold[q])
+                        tally[r["outcome"]] += 1
+                        ok += int(r["faulty_correct"])
+                finally:
+                    self.fmt.restore(h)
+                out.write({"fault": i, "bit_class": cls, "bit": bit, "layer": L,
+                           "layer_name": self.fmt.layers[L].name, "field": field,
+                           "old_value": h["old_value"], "new_value": h["new_value"],
+                           "questions": len(qids), **tally,
+                           "golden_correct": sum(bool(self.gold[q]["correct"]) for q in qids),
+                           "faulty_correct": ok, "seconds": round(time.time() - t0, 1),
+                           "status": "ok"})
+                print(f"fault {i}: {h['old_value']} -> {h['new_value']} in "
+                      f"{self.fmt.layers[L].name}: {tally}")
+        return path
 
 
 # ---------------------------------------------------------------------------- helpers

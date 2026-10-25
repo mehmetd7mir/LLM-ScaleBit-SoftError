@@ -142,6 +142,14 @@ class INT4(Format):
             return [l.out_features * l.in_features for l in self.layers]
         return [l.out_features * l.n_groups for l in self.layers]
 
+    def stored_words(self, layer, cls):
+        s = layer.store
+        if cls == "element":
+            return unpack_qweight(s["qweight"])
+        if cls == "scale":
+            return s["scales"].view(torch.int16).to(torch.int32) & 0xFFFF
+        return unpack_qzeros(s["qzeros"])
+
     def bit_role(self, cls, bit):
         if cls == "scale":
             return float_role(bit, 10, 16)

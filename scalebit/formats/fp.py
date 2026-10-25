@@ -21,6 +21,7 @@ class FP(Format):
         self.layout, self.mant_bits, self.word_bits, self.name = LAYOUT[dtype]
         self.classes = {c: w for c, (_, w) in self.layout.items()}
         self.sanity = ("exponent", self.classes["exponent"] - 1)
+        self.metadata_classes = ()
 
     def prepare(self, model, targets):
         for name, mod in targets:
@@ -33,6 +34,11 @@ class FP(Format):
 
     def word_bit(self, cls, bit):
         return self.layout[cls][0] + bit
+
+    def stored_words(self, layer, cls):
+        first, width = self.layout[cls]
+        w = layer.module.weight.data.view(torch.int16 if self.word_bits == 16 else torch.int32)
+        return (w >> first) & ((1 << width) - 1)
 
     def bit_role(self, cls, bit):
         return float_role(self.word_bit(cls, bit), self.mant_bits, self.word_bits)

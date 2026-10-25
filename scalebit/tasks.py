@@ -100,7 +100,7 @@ def extract_answer(text):
 class GSM8K:
     name = "gsm8k"
 
-    def __init__(self, tok, device, n_questions=None, max_new_tokens=256, eos_ids=()):
+    def __init__(self, tok, device, n_questions=None, max_new_tokens=512, eos_ids=()):
         from datasets import load_dataset
         ds = load_dataset(*GSM8K_ID[:2], split=GSM8K_ID[2])
         self.tok = tok
@@ -172,8 +172,10 @@ class GSM8K:
             tokens, finite = self._generate(model, item["ids"], tokens[:p] + [am[p]])
         text = self.tok.decode(tokens, skip_special_tokens=True)
         pred = extract_answer(text)
+        # hit the token limit before finishing: the "answer" would be a number cut mid-reasoning
+        truncated = len(tokens) >= self.max_new and not self._stop(tokens)
         return {"qid": item["qid"], "tokens": tokens, "pred": pred, "finite": finite,
-                "correct": pred == item["answer"], "fixes": fixes,
+                "correct": pred == item["answer"], "fixes": fixes, "truncated": truncated,
                 "stable": finite and fixes < max_fix}
 
     def judge(self, model, item, gold):
@@ -194,7 +196,7 @@ class GSM8K:
                 "diverge_pos": p}
 
 
-def make_task(name, tok, device, n_questions=None, max_new_tokens=256, eos_ids=()):
+def make_task(name, tok, device, n_questions=None, max_new_tokens=512, eos_ids=()):
     if name == "mmlu":
         return MMLU(tok, device, n_questions)
     if name == "gsm8k":

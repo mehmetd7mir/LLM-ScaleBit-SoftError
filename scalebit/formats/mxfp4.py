@@ -69,6 +69,11 @@ class MXFP4(Format):
             return [l.out_features * l.in_features for l in self.layers]
         return [l.out_features * (l.in_features // BLOCK) for l in self.layers]
 
+    def stored_words(self, layer, cls):
+        if cls == "element":
+            return unpack_nibbles(layer.store["codes"]).to(torch.int16)
+        return layer.store["scales"].to(torch.int16)
+
     def bit_role(self, cls, bit):
         return e2m1_role(bit) if cls == "element" else "exponent"
 

@@ -41,7 +41,11 @@ def load(results_root):
             continue
         df = pd.concat(parts, ignore_index=True)
         df = df[df.status == "ok"]
-        runs.append({"dir": d, "info": info, "trials": df})
+        const = None
+        if os.path.exists(os.path.join(d, "constant_bits.json")):
+            with open(os.path.join(d, "constant_bits.json")) as f:
+                const = json.load(f)
+        runs.append({"dir": d, "info": info, "trials": df, "constant_bits": const})
     return runs
 
 
@@ -64,10 +68,24 @@ def environment(runs):
     return df
 
 
-def avf_by_position(runs):
+def _protect(df, const):
+    """Trials whose flipped bit is constant in its layer count as masked: a decoder that forces
+    known-constant bits back to their value corrects exactly these flips."""
+    if not const:
+        return df
+    hit = [str(b) in const.get(c, [{}] * (L + 1))[L] if c in const else False
+           for c, L, b in zip(df.bit_class, df.layer, df.bit)]
+    df = df.copy()
+    df.loc[hit, "outcome"] = "masked"
+    return df
+
+
+def avf_by_position(runs, protected=False):
     rows = []
     for r in runs:
         i, df = r["info"], r["trials"]
+        if protected:
+            df = _protect(df, r.get("constant_bits"))
         for (cls, b), g in df.groupby(["bit_class", "bit"]):
             n = len(g)
             k = int(g.outcome.isin(FAIL).sum())
@@ -84,33 +102,39 @@ def avf_by_position(runs):
 
 
 def avf_by_class(pos):
+    """Class AVF and its interval from the pooled counts. Every bit position of a class gets the
+    same number of trials and holds the same number of bits, so the pooled share equals the
+    bit-weighted average, and one Clopper-Pearson interval on the pooled counts is valid
+    (and much tighter than adding up per-position bounds)."""
     keys = ["model", "task", "format", "dtype", "class"]
-    g = pos.groupby(keys)
-    out = g.agg(n=("n", "sum"), fail=("fail", "sum"), sdc=("sdc", "sum"),
-                visible=("visible", "sum"), avf=("avf", "mean"), avf_hi=("avf_hi", "mean"),
-                metadata=("metadata", "first")).reset_index()
+    out = pos.groupby(keys).agg(n=("n", "sum"), fail=("fail", "sum"), sdc=("sdc", "sum"),
+                                visible=("visible", "sum"), benign=("benign", "sum"),
+                                positions=("bit", "count"),
+                                fields_per_weight=("fields_per_weight", "first"),
+                                metadata=("metadata", "first")).reset_index()
+    ci = [clopper_pearson(int(k), int(n)) for k, n in zip(out.fail, out.n)]
+    out["avf"] = out.fail / out.n
+    out["avf_lo"] = [c[0] for c in ci]
+    out["avf_hi"] = [c[1] for c in ci]
+    out["bits_per_weight"] = out.fields_per_weight * out.positions
     out["visible_share"] = np.where(out.fail > 0, out.visible / out.fail.clip(lower=1), np.nan)
     return out
 
 
 def fit_table(pos):
-    pos = pos.assign(fit=pos.fields_per_weight * pos.avf,
-                     fit_lo=pos.fields_per_weight * pos.avf_lo,
-                     fit_hi=pos.fields_per_weight * pos.avf_hi)
+    cls = avf_by_class(pos)
+    cls = cls.assign(fit=cls.bits_per_weight * cls.avf, fit_lo=cls.bits_per_weight * cls.avf_lo,
+                     fit_hi=cls.bits_per_weight * cls.avf_hi)
     keys = ["model", "task", "format", "dtype"]
     rows = []
-    for k, g in pos.groupby(keys):
+    for k, g in cls.groupby(keys):
         meta, elem = g[g.metadata], g[~g.metadata]
         total = g.fit.sum()
         row = dict(zip(keys, k))
         row.update({
-            "bits_per_weight": float((g.groupby("class").fields_per_weight.first()
-                                      * g.groupby("class").size()).sum()),
+            "bits_per_weight": float(g.bits_per_weight.sum()),
             "fit": total, "fit_lo": g.fit_lo.sum(), "fit_hi": g.fit_hi.sum(),
-            "metadata_bit_share": float(
-                (meta.groupby("class").fields_per_weight.first() * meta.groupby("class").size()).sum()
-                / (g.groupby("class").fields_per_weight.first() * g.groupby("class").size()).sum())
-            if len(meta) else 0.0,
+            "metadata_bit_share": float(meta.bits_per_weight.sum() / g.bits_per_weight.sum()),
             "metadata_fit_share": meta.fit.sum() / total if total > 0 else np.nan,
             # pessimistic for the claim "metadata dominates": elements at their upper bound
             "metadata_fit_share_min": meta.fit.sum() / (meta.fit.sum() + elem.fit_hi.sum())
@@ -118,8 +142,12 @@ def fit_table(pos):
         })
         rows.append(row)
     df = pd.DataFrame(rows)
-    base = df[df.format.isin(["fp16", "bf16", "fp32"])].set_index(["model", "task", "dtype"]).fit
-    df["fit_vs_fp"] = [r.fit / base.get((r.model, r.task, r.dtype), np.nan) for r in df.itertuples()]
+    base = df[df.format.isin(["fp16", "bf16", "fp32"])].set_index(["model", "task", "dtype"])
+    df["fit_vs_fp"] = [r.fit / base.fit.get((r.model, r.task, r.dtype), np.nan)
+                       for r in df.itertuples()]
+    # pessimistic ratio: this format at its upper bound against the baseline at its lower bound
+    df["fit_vs_fp_worst"] = [r.fit_hi / base.fit_lo.get((r.model, r.task, r.dtype), np.nan)
+                             for r in df.itertuples()]
     return df
 
 
@@ -163,6 +191,26 @@ def protection_curve(pos):
     return pd.DataFrame(rows)
 
 
+def persistent_table(results_root):
+    """One row per persistent-fault experiment: how many questions one flip breaks."""
+    rows = []
+    for p in sorted(glob.glob(os.path.join(results_root, "**", "persistent_*.csv"), recursive=True)):
+        df = pd.read_csv(p)
+        df = df[df.status == "ok"]
+        if df.empty:
+            continue
+        with open(os.path.join(os.path.dirname(p), "run_info.json")) as f:
+            info = json.load(f)[-1]
+        broken = (df.sdc + df.visible) / df.questions
+        rows.append({**_key(info), "class": df.bit_class.iloc[0], "bit": int(df.bit.iloc[0]),
+                     "faults": len(df), "mean_share_broken": broken.mean(),
+                     "faults_breaking_all": int((broken >= 0.99).sum()),
+                     "faults_breaking_none": int((broken == 0).sum()),
+                     "mean_accuracy_faulty": (df.faulty_correct / df.questions).mean(),
+                     "accuracy_golden": (df.golden_correct / df.questions).mean()})
+    return pd.DataFrame(rows)
+
+
 def report(results_root, out_dir=None, plots=True):
     out_dir = out_dir or os.path.join(results_root, "analysis")
     os.makedirs(out_dir, exist_ok=True)
@@ -173,7 +221,9 @@ def report(results_root, out_dir=None, plots=True):
     pos = avf_by_position(runs)
     tables.update({"avf_by_position": pos, "avf_by_class": avf_by_class(pos),
                    "fit": fit_table(pos), "se_amplification": se_amplification(pos),
-                   "protection_curve": protection_curve(pos)})
+                   "protection_curve": protection_curve(pos),
+                   "fit_constant_bits_protected": fit_table(avf_by_position(runs, protected=True)),
+                   "persistent": persistent_table(results_root)})
     for name, df in tables.items():
         df.to_csv(os.path.join(out_dir, f"{name}.csv"), index=False)
     if plots:

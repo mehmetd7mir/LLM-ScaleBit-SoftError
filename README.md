@@ -36,6 +36,15 @@ calibrated quantizer. Checks against reference implementations:
   - `visible`: NaN or Inf appeared.
   - `benign`: GSM8K only; the text changed but the final answer did not.
 
+Two extra measurements:
+
+- **Constant bits.** At setup, every tensor's stored metadata is scanned for bit positions that
+  never change (for example the E8M0 MSB, which is 0 unless a block holds a weight of 8 or
+  more). They are saved to `constant_bits.json`. The analysis then reports the FIT a decoder
+  would have if it forced those bits back to their known value, using the same trials.
+- **Persistent faults.** `Experiment.run_persistent(cls, bit)` keeps one flip in place while
+  every question is answered, since a memory fault lasts until the model is reloaded.
+
 The stored arrays live on the CPU and the dequantized weights live on the GPU. A flip
 recomputes only the weights that depend on the flipped bit: one element, one block or group,
 or, for the NVFP4 tensor scale, the whole layer.
@@ -44,7 +53,8 @@ or, for the NVFP4 tensor scale, the whole layer.
 
 - **`mmlu`:** tinyMMLU, 100 questions. One forward pass picks the answer from the logits of
   A/B/C/D.
-- **`gsm8k`:** tinyGSM8K, 100 questions, greedy decoding. A faulty run is first checked with a
+- **`gsm8k`:** tinyGSM8K, 100 questions, greedy decoding (up to 512 tokens; goldens that hit
+  the limit are left out of the trials). A faulty run is first checked with a
   single teacher-forced pass over the golden tokens. If every argmax matches, the output is
   identical and no generation is needed. Otherwise generation continues from the first
   divergent token and the final number is compared with the golden answer.
@@ -55,13 +65,18 @@ Open `notebooks/run_experiment.ipynb` in Colab with an L4 runtime, set the confi
 all cells. The notebook clones this repository, writes results to Google Drive and resumes
 after a disconnect. `notebooks/analyze.ipynb` builds the tables and plots from all runs.
 
+Class-level AVF intervals are Clopper-Pearson on the pooled counts of the class. This is valid
+because every bit position of a class gets the same number of trials.
+
 Results layout:
 
 ```
 <results_root>/<study>/<model>/<task>/<format>_<dtype>/
     run_info.json       settings, versions, GPU, git commit
     golden.jsonl        fault-free output per question
+    constant_bits.json  bit positions that never change, per tensor and class
     trials_<class>.csv  one row per trial
+    persistent_<class>_b<bit>.csv   optional persistent-fault runs
 ```
 
 ## Local tests

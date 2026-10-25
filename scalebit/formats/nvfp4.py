@@ -78,6 +78,13 @@ class NVFP4(Format):
             return [l.out_features * (l.in_features // BLOCK) for l in self.layers]
         return [1 for _ in self.layers]
 
+    def stored_words(self, layer, cls):
+        if cls == "element":
+            return unpack_nibbles(layer.store["codes"]).to(torch.int16)
+        if cls == "scale":
+            return layer.store["scales"].to(torch.int16)
+        return layer.store["tensor_scale"].view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+
     def bit_role(self, cls, bit):
         if cls == "element":
             return e2m1_role(bit)
